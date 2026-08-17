@@ -1,0 +1,54 @@
+name: Scrape Google Maps (wellness)
+
+on:
+  # Lancement manuel depuis l'onglet "Actions" de GitHub
+  workflow_dispatch:
+  # Optionnel : décommente pour un lancement automatique programmé
+  # schedule:
+  #   - cron: "0 3 * * *"   # tous les jours à 3h UTC
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # Filet de sécurité : coupe le job s'il bloque (captcha en boucle, page figée)
+    # au lieu de laisser tourner jusqu'à la limite max de 6h et gaspiller des minutes.
+    timeout-minutes: 90
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Lancer le script
+        run: python scrape_wellness_rapide.py
+
+      # Sauvegarde les résultats + l'état d'avancement (villes.csv mis à jour)
+      # même si le job est interrompu (timeout, erreur), pour ne rien perdre.
+      - name: Uploader les résultats (toujours, même en cas d'échec)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultats-scraping
+          path: |
+            resultats_visibles.csv
+            villes.csv
+
+      # Optionnel : recommit automatiquement villes.csv et resultats_visibles.csv
+      # dans le dépôt, pour reprendre pile où on s'est arrêté au prochain lancement.
+      - name: Commit des résultats dans le dépôt
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add villes.csv resultats_visibles.csv || true
+          git diff --staged --quiet || git commit -m "Mise à jour résultats scraping [skip ci]"
+          git push || true
