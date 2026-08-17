@@ -4,26 +4,12 @@ Extraction des résultats VISIBLES d'une recherche Google Maps — SANS API.
 Version RAPIDE : traite plusieurs villes EN PARALLÈLE (plusieurs onglets
 dans le même navigateur) au lieu d'une ville à la fois.
 
-C'est le vrai levier de vitesse par rapport à la version séquentielle :
-avec 200+ villes, attendre chaque page une par une est le principal goulot
-d'étranglement, pas la durée des pauses elles-mêmes.
-
 ⚠️ Important :
 - Toujours pas l'API officielle Google : automatisation de navigateur.
-  Plus d'onglets en parallèle = plus de requêtes/minute vers Google =
-  risque de blocage/captcha plus élevé. 6-8 onglets est un compromis
-  raisonnable, pas une garantie.
-- Si Google bloque en cours de route (captcha, page vide inhabituelle),
-  le script continue sur les autres villes mais celle-ci sera à revérifier
-  manuellement (elle ne sera pas marquée "traité" si aucun résultat n'a pu
-  être lu, donc elle sera retentée au prochain lancement).
-
-Installation :
-    pip install playwright
-    playwright install chromium
-
-Entrée  : villes.csv          (colonne "ville" ; colonne "statut" ajoutée/mise à jour)
-Sortie  : resultats_visibles.csv (écriture en temps réel, une ligne par établissement)
+- Nombre de fenêtres/onglets en parallèle réduit pour éviter les bans IP 
+  et surcharges sur l'infrastructure GitHub Actions.
+- Intégration d'une sécurité temporelle (Time-out propre) pour éviter
+  la corruption des fichiers CSV en fin de job.
 
 Lancement :
     python scrape_wellness_rapide.py
@@ -35,6 +21,7 @@ import os
 import re
 import sys
 import random
+import time
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
@@ -60,10 +47,15 @@ HEADLESS = True
 MAX_ETABLISSEMENTS_PAR_REQUETE = 25
 
 # Nombre de villes traitées EN MÊME TEMPS (chacune dans son propre onglet).
-CONCURRENCE = 15
-PAUSE_COURTE = (0.2, 0.4)
-PAUSE_ENTRE_VILLES = (0.6, 1.2)  # par onglet, entre deux villes qu'il traite
-PAUSE_SCROLL = (0.35, 0.6)
+# Réduit de 15 à 6 pour éviter les blocages immédiats de Google et l'erreur de commit.
+CONCURRENCE = 6 
+PAUSE_COURTE = (0.5, 1.0)
+PAUSE_ENTRE_VILLES = (1.5, 3.0)  
+PAUSE_SCROLL = (0.6, 1.2)
+
+# Sécurité temporelle pour GitHub Actions (Arrêt propre avant les 90 minutes du workflow)
+HEURE_DE_DEBUT = time.time()
+LIMITE_TEMPS_SECONDES = 80 * 60  # 80 minutes max
 
 RATING_REGEX = re.compile(r"^\d[.,]\d$")
 REVIEWS_REGEX = re.compile(r"^\(([\d\s.,]+)\)$")
@@ -91,7 +83,7 @@ async def pause(bornes):
 
 
 # ============================================================
-# Lecture / écriture villes.csv
+# Lecture / écriture fichiers
 # ============================================================
 
 def read_text_any_encoding(path):
@@ -105,6 +97,11 @@ def read_text_any_encoding(path):
 
 
 def load_cities(path):
+    if not os.path.exists(path):
+        # Crée un fichier d'exemple si absent
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            f.write("ville,statut\nParis,\nLyon,\nMarseille,\n")
+    
     content, enc_used = read_text_any_encoding(path)
     print(f"[i] {path} lu avec l'encodage : {enc_used}")
     reader = csv.DictReader(content.splitlines())
@@ -128,8 +125,6 @@ def load_cities(path):
 
 
 def save_cities(path, rows, fieldnames, max_tentatives=5):
-    """Plusieurs tentatives : sur Windows, le fichier peut être temporairement
-    verrouillé (Excel ouvert, antivirus). On réessaie au lieu de planter."""
     import time as _time
     for tentative in range(1, max_tentatives + 1):
         try:
@@ -140,15 +135,26 @@ def save_cities(path, rows, fieldnames, max_tentatives=5):
             return True
         except PermissionError:
             if tentative == 1:
-                print(f"     [!] {path} semble ouvert dans un autre programme "
-                      f"(Excel ?). Ferme-le si possible. Nouvelle tentative dans 3s...")
+                print(f"     [!] {path} semble ouvert dans un autre programme. Nouvelle tentative dans 3s...")
             _time.sleep(3)
-    print(f"     [!!] Impossible d'écrire {path} après {max_tentatives} tentatives. "
-          f"Cette ville sera retraitée au prochain lancement.")
+    print(f"     [!!] Impossible d'écrire {path} après {max_tentatives} tentatives.")
     return False
 
 
-def mark_done(rows, fieldnames, col_ville, city, path, lock_dict):
+def init_resultats_file():
+    if not os.path.exists(RESULTATS_CSV):
+        with open(RESULTATS_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=COLONNES_RESULTATS)
+            writer.writeheader()
+
+
+def write_row_to_csv(row_data):
+    with open(RESULTATS_CSV, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=COLONNES_RESULTATS)
+        writer.writerow(row_data)
+
+
+def mark_done(rows, fieldnames, col_ville, city, path):
     for r in rows:
         if r.get(col_ville, "").strip() == city:
             r["statut"] = f"traité ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
@@ -156,7 +162,7 @@ def mark_done(rows, fieldnames, col_ville, city, path, lock_dict):
 
 
 # ============================================================
-# Extraction depuis la liste de résultats (sans ouvrir les fiches)
+# Extraction depuis la liste de résultats
 # ============================================================
 
 def clean_text(text):
@@ -195,13 +201,13 @@ def parse_card_text(raw_text):
     return nom, note, avis, categorie, adresse
 
 
-async def search_and_scrape(page, query, city, activite, write_row):
+async def search_and_scrape(page, query, city, activite):
     search_text = f"{query} à {city}"
     url = f"https://www.google.com/maps/search/{search_text.replace(' ', '+')}/?hl=fr"
     print(f"  [{city}] -> {activite}")
 
     try:
-        await page.goto(url, timeout=15000)
+        await page.goto(url, timeout=20000)
     except PWTimeout:
         print(f"     [!] [{city}] timeout au chargement, on passe")
         return
@@ -210,9 +216,9 @@ async def search_and_scrape(page, query, city, activite, write_row):
 
     try:
         results_panel = page.locator('div[role="feed"]').first
-        await results_panel.wait_for(timeout=5000)
+        await results_panel.wait_for(timeout=7000)
     except PWTimeout:
-        print(f"     [!] [{city}] pas de panneau de résultats (0 résultat ou page inattendue)")
+        print(f"     [!] [{city}] pas de panneau de résultats pour '{city}' (0 résultat ou blocage/captcha)")
         return
 
     previous_count = 0
@@ -233,128 +239,113 @@ async def search_and_scrape(page, query, city, activite, write_row):
     cards = (await results_panel.locator("a.hfpxzc").all())[:MAX_ETABLISSEMENTS_PAR_REQUETE]
     print(f"     [{city}] {len(cards)} établissement(s) repérés pour '{activite}'")
 
-    # Plus de vérification de doublon ici : chaque établissement trouvé
-    # est écrit tel quel dans le fichier résultat, même s'il apparaît
-    # plusieurs fois (autre ville, autre requête, ou relance du script).
     for card_link in cards:
         href = await card_link.get_attribute("href")
         if not href:
             continue
 
         try:
-            container = card_link.locator("xpath=..")
-            raw_text = await container.inner_text(timeout=1500)
-        except Exception:
-            continue
-
-        nom, note, avis, categorie, adresse = parse_card_text(raw_text)
-        if not nom:
-            continue
-
-        row = [nom, note, avis, categorie, adresse, city, activite, href]
-        await write_row(row)
-
-
-async def traiter_ville(context, city, write_row, sem):
-    """Traite une ville complète (toutes les requêtes REQUETES) dans son
-    propre onglet, sous protection du sémaphore de concurrence."""
-    async with sem:
-        page = await context.new_page()
-        page.set_default_timeout(5000)
-        try:
-            print(f"\n=== {city} ===")
-            for query, activite in REQUETES:
-                await search_and_scrape(page, query, city, activite, write_row)
-            await pause(PAUSE_ENTRE_VILLES)
-            return city, True
+            raw_text = await card_link.inner_text()
+            nom, note, avis, categorie, adresse = parse_card_text(raw_text)
+            
+            if nom:
+                row_data = {
+                    "Nom de l'établissement": nom,
+                    "Note": note,
+                    "Nombre d'avis": avis,
+                    "Catégorie": categorie,
+                    "Adresse / résumé": adresse,
+                    "Ville": city,
+                    "Activité": activite,
+                    "URL Google Maps": href
+                }
+                write_row_to_csv(row_data)
         except Exception as e:
-            print(f"  [!!] [{city}] erreur inattendue : {e}")
-            return city, False
-        finally:
-            await page.close()
+            print(f"     [!] Erreur lors de la lecture d'une carte à {city} : {e}")
+            continue
+
+
+async def worker(queue, browser, rows, fieldnames, col_ville, lock):
+    # Chaque worker gère son propre onglet/contexte pour isoler les requêtes
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    page = await context.new_page()
+    await page.route("**/*", bloquer_ressources_inutiles)
+
+    while True:
+        # Sécurité temporelle anti-crash globale
+        if time.time() - HEURE_DE_DEBUT > LIMITE_TEMPS_SECONDES:
+            print(f"[Worker] Alerte limite de temps atteinte. Fermeture de l'onglet.")
+            queue.task_done()
+            break
+
+        try:
+            city = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+        print(f"[+] Traitement de la ville : {city}")
+        
+        # Exécution des différentes requêtes pour cette ville
+        for query, activite in REQUETES:
+            await search_and_scrape(page, query, city, activite)
+            await pause(PAUSE_COURTE)
+
+        # Verrouillage asynchrone pour éviter les conflits d'écriture simultanés sur villes.csv
+        async with lock:
+            mark_done(rows, fieldnames, col_ville, city, VILLES_CSV)
+
+        await pause(PAUSE_ENTRE_VILLES)
+        queue.task_done()
+
+    await context.close()
 
 
 async def main():
-    if not os.path.exists(VILLES_CSV):
-        print(f"[!] Fichier introuvable : {VILLES_CSV}")
-        sys.exit(1)
-
+    print("[i] Démarrage du script de scraping rapide...")
+    init_resultats_file()
+    
     rows, fieldnames, col_ville = load_cities(VILLES_CSV)
-    villes_a_traiter = [r[col_ville].strip() for r in rows
-                         if r[col_ville].strip() and not r.get("statut", "").startswith("traité")]
+    villes_a_traiter = [r[col_ville].strip() for r in rows if not r.get("statut", "").startswith("traité")]
+    
+    if not villes_a_traiter:
+        print("[i] Toutes les villes ont déjà été traitées dans villes.csv !")
+        return
 
-    print(f"{len(villes_a_traiter)} ville(s) à traiter sur {len(rows)} au total")
-    print(f"Concurrence : {CONCURRENCE} onglet(s) en parallèle")
+    print(f"[i] {len(villes_a_traiter)} ville(s) restante(s) à traiter.")
 
-    file_exists = os.path.exists(RESULTATS_CSV)
+    queue = asyncio.Queue()
+    for v in villes_a_traiter:
+        queue.put_nowait(v)
 
-    out_f = open(RESULTATS_CSV, "a", newline="", encoding="utf-8-sig")
-    csv_writer = csv.writer(out_f)
-    if not file_exists:
-        csv_writer.writerow(COLONNES_RESULTATS)
-        out_f.flush()
-
-    write_lock = asyncio.Lock()
-    csv_villes_lock = asyncio.Lock()
-
-    async def write_row(row):
-        # Toutes les coroutines écrivent dans le même fichier : un verrou
-        # évite que deux lignes se mélangent en cas d'écriture simultanée.
-        async with write_lock:
-            csv_writer.writerow(row)
-            out_f.flush()
-
-    sem = asyncio.Semaphore(CONCURRENCE)
+    lock = asyncio.Lock()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--disable-translate",
-                "--disable-default-apps",
-                "--mute-audio",
-                "--no-first-run",
-            ],
-        )
-        context = await browser.new_context(
-            locale="fr-FR", viewport={"width": 1000, "height": 700}
-        )
-        await context.route("**/*", bloquer_ressources_inutiles)
+        browser = await p.chromium.launch(headless=HEADLESS)
+        
+        # Création des workers parallèles selon la configuration de CONCURRENCE
+        tasks = []
+        num_workers = min(CONCURRENCE, len(villes_a_traiter))
+        print(f"[i] Lancement de {num_workers} onglet(s) en parallèle.")
+        
+        for _ in range(num_workers):
+            task = asyncio.create_task(worker(queue, browser, rows, fieldnames, col_ville, lock))
+            tasks.append(task)
 
-        consent_page = await context.new_page()
-        try:
-            await consent_page.goto("https://www.google.com/maps?hl=fr", timeout=15000)
-            consent_btn = consent_page.locator("button:has-text('Tout accepter')").first
-            if await consent_btn.is_visible(timeout=2000):
-                await consent_btn.click()
-        except Exception:
-            pass
-        await consent_page.close()
-
-        taches = [
-            traiter_ville(context, city, write_row, sem)
-            for city in villes_a_traiter
-        ]
-
-        traitees = 0
-        for coro in asyncio.as_completed(taches):
-            city, succes = await coro
-            if succes:
-                async with csv_villes_lock:
-                    mark_done(rows, fieldnames, col_ville, city, VILLES_CSV, None)
-                print(f"  [OK] {city} marquée 'traité'")
-            traitees += 1
-            print(f"--- Progression : {traitees}/{len(villes_a_traiter)} villes ---")
-
+        await queue.join()
+        
+        # Annulation des workers si la file s'est arrêtée suite à la limite de temps
+        for task in tasks:
+            task.cancel()
+            
         await browser.close()
-
-    out_f.close()
-    print(f"\nTerminé. Résultats dans {RESULTATS_CSV}")
+    
+    print(f"[i] Session terminée. Temps écoulé : {round((time.time() - HEURE_DE_DEBUT)/60, 2)} minutes.")
 
 
 if __name__ == "__main__":
+    # Correctif pour la boucle d'événements asynchrones sur Windows si exécuté en local
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

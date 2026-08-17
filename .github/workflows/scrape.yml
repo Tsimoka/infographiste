@@ -1,27 +1,29 @@
 name: Scrape Google Maps (wellness)
 
 on:
-  # Lancement manuel depuis l'onglet "Actions" de GitHub
   workflow_dispatch:
-  # Optionnel : décommente pour un lancement automatique programmé
-  # schedule:
-  #   - cron: "0 3 * * *"   # tous les jours à 3h UTC
+
+# Accorde les permissions d'écriture pour que le bot puisse push sans rejet de GitHub
+permissions:
+  contents: write
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # Filet de sécurité : coupe le job s'il bloque (captcha en boucle, page figée)
-    # au lieu de laisser tourner jusqu'à la limite max de 6h et gaspiller des minutes.
     timeout-minutes: 90
 
     steps:
       - name: Récupérer le dépôt
         uses: actions/checkout@v4
+        with:
+          # Récupère tout l'historique pour éviter les conflits de rebase lors du push
+          fetch-depth: 0
 
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip' # Accélère le lancement des prochains jobs
 
       - name: Installer les dépendances
         run: |
@@ -31,9 +33,8 @@ jobs:
       - name: Lancer le script
         run: python scrape_wellness_rapide.py
 
-      # Sauvegarde les résultats + l'état d'avancement (villes.csv mis à jour)
-      # même si le job est interrompu (timeout, erreur), pour ne rien perdre.
-      - name: Uploader les résultats (toujours, même en cas d'échec)
+      # L'artefact reste disponible au téléchargement direct en haut du job (Zip)
+      - name: Uploader les résultats (Sécurité)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -42,13 +43,25 @@ jobs:
             resultats_visibles.csv
             villes.csv
 
-      # Optionnel : recommit automatiquement villes.csv et resultats_visibles.csv
-      # dans le dépôt, pour reprendre pile où on s'est arrêté au prochain lancement.
+      # On ne commit QUE si le script Python s'est terminé proprement (success)
+      # pour éviter d'envoyer des fichiers CSV corrompus par un timeout ou un crash.
       - name: Commit des résultats dans le dépôt
-        if: always()
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add villes.csv resultats_visibles.csv || true
-          git diff --staged --quiet || git commit -m "Mise à jour résultats scraping [skip ci]"
-          git push || true
+          
+          # Évite les erreurs si le fichier n'existe pas encore
+          touch villes.csv resultats_visibles.csv
+          
+          git add villes.csv resultats_visibles.csv
+          
+          # On vérifie s'il y a de vrais changements avant de commit
+          if ! git diff --staged --quiet; then
+            git commit -m "Mise à jour résultats scraping [skip ci]"
+            # Le pull --rebase évite le blocage si vous avez modifié un truc sur le web entre-temps
+            git pull --rebase origin main
+            git push origin main
+          else
+            echo "Aucun nouveau résultat à committer."
+          fi
