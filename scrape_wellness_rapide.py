@@ -48,7 +48,7 @@ MAX_ETABLISSEMENTS_PAR_REQUETE = 25
 
 # Nombre de villes traitées EN MÊME TEMPS (chacune dans son propre onglet).
 # Réduit de 15 à 6 pour éviter les blocages immédiats de Google et l'erreur de commit.
-CONCURRENCE = 6 
+CONCURRENCE = 8
 PAUSE_COURTE = (0.5, 1.0)
 PAUSE_ENTRE_VILLES = (1.5, 3.0)  
 PAUSE_SCROLL = (0.6, 1.2)
